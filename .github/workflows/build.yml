@@ -1,0 +1,216 @@
+# finnish app: one zip in, four platforms out.
+# Put this file at  .github/workflows/build.yml  in the app repository (nishan-tradeweb/finnish-app), next to finnish-app.zip.
+# Delete the older workflow files in .github/workflows (build-apk.yml, build-exe.yml, pages.yml, build-desktop.yml) so only this one runs.
+# It runs only when you press  Actions > Build finnish > Run workflow.  It reads your Firebase / Google values from GitHub secrets,
+# so you never edit config.js by hand.  The Android key comes from the "Make Android key" workflow (keystore.yml), run once.
+#
+#  Android   -> finnish-1.0.0.apk (install on phones) and finnish-1.0.0.aab (upload to Google Play), signed with YOUR key
+#  Windows   -> finnish-setup-1.0.0.exe (installer) and finnish-portable-1.0.0.exe
+#  macOS     -> finnish-1.0.0.dmg (not yet signed; sign later with your Apple developer ID)
+#  iPhone/Mac web version -> published at https://nishan-tradeweb.github.io/finnish-app/  (Add to Home Screen / Install)
+#  Everything is also attached to a GitHub Release "v1.0.0" so each file gets a permanent download link.
+name: Build finnish (Android, Windows, macOS, web)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: finnish-build
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  FB_KEY: ${{ secrets.FIREBASE_API_KEY }}
+  FB_PROJECT: ${{ secrets.FIREBASE_PROJECT_ID }}
+  FB_REGION: ${{ secrets.FIREBASE_REGION }}
+  G_WEB: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+  G_ANDROID: ${{ secrets.GOOGLE_ANDROID_CLIENT_ID }}
+  G_DESKTOP: ${{ secrets.GOOGLE_DESKTOP_CLIENT_ID }}
+  G_SECRET: ${{ secrets.GOOGLE_DESKTOP_CLIENT_SECRET }}
+
+jobs:
+  # ------------------------------------------------------------------ web version (iPhone, Mac and any browser)
+  web:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract finnish-app.zip
+        run: |
+          test -f finnish-app.zip || { echo "finnish-app.zip not found in the repository root"; exit 1; }
+          rm -rf app && mkdir app && unzip -q finnish-app.zip -d app
+          if [ ! -f app/package.json ]; then inner=$(find app -maxdepth 2 -name package.json | head -n1 | xargs -r dirname); [ -n "$inner" ] || { echo "package.json not found in the zip"; exit 1; }; mv "$inner"/* "$inner"/.[!.]* app/ 2>/dev/null || true; fi
+      - name: Write settings (config.js) from your GitHub secrets
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'),e=process.env,v=require('./app/package.json').version;fs.writeFileSync('app/www/config.js','window.FINNISH_CONFIG = '+JSON.stringify({version:v,firebase:{apiKey:e.FB_KEY||'',projectId:e.FB_PROJECT||'',region:e.FB_REGION||'us-central1'},google:{webClientId:e.G_WEB||'',androidClientId:e.G_ANDROID||'',desktopClientId:e.G_DESKTOP||'',desktopClientSecret:e.G_SECRET||''},billingLive:false,webAppUrl:'https://nishan-tradeweb.github.io/finnish-app/',support:'mailstonishan@gmail.com'},null,2)+';\n')"
+          echo "config.js written (apiKey set: $([ -n "$FB_KEY" ] && echo yes || echo NO)); project: $FB_PROJECT"
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Download fonts
+        working-directory: app
+        run: node scripts/fetch-fonts.mjs
+      - run: touch app/www/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with: { path: app/www }
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # ------------------------------------------------------------------ Android
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract finnish-app.zip
+        run: |
+          test -f finnish-app.zip || { echo "finnish-app.zip not found in the repository root"; exit 1; }
+          rm -rf app && mkdir app && unzip -q finnish-app.zip -d app
+          if [ ! -f app/package.json ]; then inner=$(find app -maxdepth 2 -name package.json | head -n1 | xargs -r dirname); [ -n "$inner" ] || { echo "package.json not found in the zip"; exit 1; }; mv "$inner"/* "$inner"/.[!.]* app/ 2>/dev/null || true; fi
+      - name: Write settings (config.js) from your GitHub secrets
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'),e=process.env,v=require('./app/package.json').version;fs.writeFileSync('app/www/config.js','window.FINNISH_CONFIG = '+JSON.stringify({version:v,firebase:{apiKey:e.FB_KEY||'',projectId:e.FB_PROJECT||'',region:e.FB_REGION||'us-central1'},google:{webClientId:e.G_WEB||'',androidClientId:e.G_ANDROID||'',desktopClientId:e.G_DESKTOP||'',desktopClientSecret:e.G_SECRET||''},billingLive:false,webAppUrl:'https://nishan-tradeweb.github.io/finnish-app/',support:'mailstonishan@gmail.com'},null,2)+';\n')"
+          echo "config.js written (apiKey set: $([ -n "$FB_KEY" ] && echo yes || echo NO)); project: $FB_PROJECT"
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - uses: android-actions/setup-android@v3
+      - name: Install
+        working-directory: app
+        run: |
+          npm install --no-audit --no-fund
+          node scripts/fetch-fonts.mjs
+      - name: Create the Android project
+        working-directory: app
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android || echo "icon generation skipped"
+          npx cap sync android
+      - name: Unlock the Android key
+        env:
+          PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -f keystore/finnish-release.jks.enc || { echo "No key yet. Run the workflow 'Make Android key' once first."; exit 1; }
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in keystore/finnish-release.jks.enc -out "$RUNNER_TEMP/ks.jks" -pass env:PW
+          B=$(base64 -w0 "$RUNNER_TEMP/ks.jks"); echo "::add-mask::$B"; echo "ANDROID_KEYSTORE_B64=$B" >> "$GITHUB_ENV"
+      - name: Patch (signing, version, sign-in link, print helper)
+        working-directory: app
+        run: |
+          export FINNISH_VERSION=$(node -p "require('./package.json').version")
+          export FINNISH_VERSION_CODE=${{ github.run_number }}
+          bash scripts/patch-android.sh
+      - name: Build signed release (APK and AAB)
+        working-directory: app/android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: finnish
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease bundleRelease --no-daemon
+      - name: Name the files
+        run: |
+          V=$(node -p "require('./app/package.json').version")
+          mkdir -p out
+          cp app/android/app/build/outputs/apk/release/app-release.apk "out/finnish-$V.apk"
+          cp app/android/app/build/outputs/bundle/release/app-release.aab "out/finnish-$V.aab"
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with: { name: finnish-android, path: out/*, if-no-files-found: error }
+
+  # ------------------------------------------------------------------ Windows
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract finnish-app.zip
+        shell: bash
+        run: |
+          test -f finnish-app.zip || { echo "finnish-app.zip not found in the repository root"; exit 1; }
+          rm -rf app && mkdir app && unzip -q finnish-app.zip -d app
+          if [ ! -f app/package.json ]; then inner=$(find app -maxdepth 2 -name package.json | head -n1 | xargs -r dirname); [ -n "$inner" ] || { echo "package.json not found in the zip"; exit 1; }; mv "$inner"/* "$inner"/.[!.]* app/ 2>/dev/null || true; fi
+      - name: Write settings (config.js) from your GitHub secrets
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'),e=process.env,v=require('./app/package.json').version;fs.writeFileSync('app/www/config.js','window.FINNISH_CONFIG = '+JSON.stringify({version:v,firebase:{apiKey:e.FB_KEY||'',projectId:e.FB_PROJECT||'',region:e.FB_REGION||'us-central1'},google:{webClientId:e.G_WEB||'',androidClientId:e.G_ANDROID||'',desktopClientId:e.G_DESKTOP||'',desktopClientSecret:e.G_SECRET||''},billingLive:false,webAppUrl:'https://nishan-tradeweb.github.io/finnish-app/',support:'mailstonishan@gmail.com'},null,2)+';\n')"
+          echo "config.js written (apiKey set: $([ -n "$FB_KEY" ] && echo yes || echo NO)); project: $FB_PROJECT"
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Build
+        working-directory: app
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+          node scripts/fetch-fonts.mjs
+          npx electron-builder --win --publish never
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finnish-windows
+          path: |
+            app/dist/finnish-setup-*.exe
+            app/dist/finnish-portable-*.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ macOS
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract finnish-app.zip
+        run: |
+          test -f finnish-app.zip || { echo "finnish-app.zip not found in the repository root"; exit 1; }
+          rm -rf app && mkdir app && unzip -q finnish-app.zip -d app
+          if [ ! -f app/package.json ]; then inner=$(find app -maxdepth 2 -name package.json | head -n1 | xargs -r dirname); [ -n "$inner" ] || { echo "package.json not found in the zip"; exit 1; }; mv "$inner"/* "$inner"/.[!.]* app/ 2>/dev/null || true; fi
+      - name: Write settings (config.js) from your GitHub secrets
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'),e=process.env,v=require('./app/package.json').version;fs.writeFileSync('app/www/config.js','window.FINNISH_CONFIG = '+JSON.stringify({version:v,firebase:{apiKey:e.FB_KEY||'',projectId:e.FB_PROJECT||'',region:e.FB_REGION||'us-central1'},google:{webClientId:e.G_WEB||'',androidClientId:e.G_ANDROID||'',desktopClientId:e.G_DESKTOP||'',desktopClientSecret:e.G_SECRET||''},billingLive:false,webAppUrl:'https://nishan-tradeweb.github.io/finnish-app/',support:'mailstonishan@gmail.com'},null,2)+';\n')"
+          echo "config.js written (apiKey set: $([ -n "$FB_KEY" ] && echo yes || echo NO)); project: $FB_PROJECT"
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Build
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm install --no-audit --no-fund
+          node scripts/fetch-fonts.mjs
+          npx electron-builder --mac --publish never
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finnish-macos
+          path: app/dist/finnish-*.dmg
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ one place with permanent download links
+  release:
+    needs: [android, windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: files, merge-multiple: true }
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la files
+          V=$(echo files/finnish-*.apk | sed -E 's#.*/finnish-(.*)\.apk#\1#')
+          TAG="v$V"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" files/* --clobber
+          else
+            gh release create "$TAG" files/* --title "finnish $V" --notes "finnish $V: Android (apk, aab), Windows (setup, portable), macOS (dmg)."
+          fi
